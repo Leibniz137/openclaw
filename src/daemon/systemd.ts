@@ -257,6 +257,12 @@ async function execSystemctl(
   return await execFileUtf8("systemctl", args);
 }
 
+async function execSudoSystemctl(
+  args: string[],
+): Promise<{ stdout: string; stderr: string; code: number }> {
+  return await execFileUtf8("sudo", ["systemctl", ...args]);
+}
+
 function readSystemctlDetail(result: { stdout: string; stderr: string }): string {
   // Concatenate both streams so pattern matchers (isSystemdUnitNotEnabled,
   // isSystemctlMissing) can see the unit status from stdout even when
@@ -384,6 +390,16 @@ function shouldFallbackToMachineUserScope(detail: string): boolean {
   );
 }
 
+function shouldFallbackToSudo(detail: string): boolean {
+  const normalized = detail.toLowerCase();
+  return (
+    normalized.includes("operation not permitted") ||
+    normalized.includes("transport endpoint is not connected") ||
+    normalized.includes("permission denied") ||
+    normalized.includes("access denied")
+  );
+}
+
 async function execSystemctlUser(
   env: GatewayServiceEnv,
   args: string[],
@@ -395,7 +411,12 @@ async function execSystemctlUser(
   if (sudoUser && sudoUser !== "root" && machineUser) {
     const machineScopeArgs = resolveSystemctlMachineUserScopeArgs(machineUser);
     if (machineScopeArgs.length > 0) {
-      return await execSystemctl([...machineScopeArgs, ...args]);
+      const result = await execSystemctl([...machineScopeArgs, ...args]);
+      if (result.code === 0) {
+        return result;
+      }
+      // Under sudo the --machine approach can still fail if the user bus is
+      // unreachable; fall through to the direct/sudo fallback chain below.
     }
   }
 
@@ -413,7 +434,22 @@ async function execSystemctlUser(
   if (machineScopeArgs.length === 0) {
     return directResult;
   }
-  return await execSystemctl([...machineScopeArgs, ...args]);
+
+  const machineResult = await execSystemctl([...machineScopeArgs, ...args]);
+  if (machineResult.code === 0) {
+    return machineResult;
+  }
+
+  // The --machine flag requires root privileges. If the unprivileged attempt
+  // failed with a permission error, retry via sudo so that users in the
+  // sudoers file can still manage their user-scope systemd services from a
+  // headless (no D-Bus session) environment.
+  const machineDetail = `${machineResult.stderr} ${machineResult.stdout}`.trim();
+  if (shouldFallbackToSudo(machineDetail)) {
+    return await execSudoSystemctl([...machineScopeArgs, ...args]);
+  }
+
+  return machineResult;
 }
 
 export async function isSystemdUserServiceAvailable(
