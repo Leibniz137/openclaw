@@ -253,14 +253,88 @@ export function parseSystemdShow(output: string): SystemdServiceInfo {
 
 async function execSystemctl(
   args: string[],
+  envOverrides?: Record<string, string>,
 ): Promise<{ stdout: string; stderr: string; code: number }> {
-  return await execFileUtf8("systemctl", args);
+  return await execFileUtf8(
+    "systemctl",
+    args,
+    envOverrides ? { env: { ...process.env, ...envOverrides } } : {},
+  );
 }
 
 async function execSudoSystemctl(
   args: string[],
 ): Promise<{ stdout: string; stderr: string; code: number }> {
   return await execFileUtf8("sudo", ["systemctl", ...args]);
+}
+
+/**
+ * Resolve the XDG_RUNTIME_DIR for a given user so that `systemctl --user` can
+ * connect to the user's D-Bus socket on headless (SSH) sessions where PAM
+ * did not set the variable. Returns env overrides to pass to execSystemctl,
+ * or null if the runtime dir cannot be determined or does not exist.
+ */
+async function resolveUserScopeEnv(env: GatewayServiceEnv): Promise<Record<string, string> | null> {
+  // If already set and the directory exists, nothing to do.
+  if (env.XDG_RUNTIME_DIR) {
+    return null;
+  }
+
+  const uid = resolveTargetUid(env);
+  if (uid === null) {
+    return null;
+  }
+
+  const runtimeDir = `/run/user/${uid}`;
+  try {
+    await fs.access(runtimeDir);
+  } catch {
+    return null;
+  }
+
+  const overrides: Record<string, string> = { XDG_RUNTIME_DIR: runtimeDir };
+
+  // Also set the bus address so systemctl can find the user bus socket.
+  if (!env.DBUS_SESSION_BUS_ADDRESS) {
+    overrides.DBUS_SESSION_BUS_ADDRESS = `unix:path=${runtimeDir}/bus`;
+  }
+
+  return overrides;
+}
+
+function resolveTargetUid(env: GatewayServiceEnv): number | null {
+  // Prefer the SUDO_USER's uid when running under sudo.
+  const sudoUid = env.SUDO_UID?.trim();
+  if (sudoUid) {
+    const parsed = Number(sudoUid);
+    if (Number.isInteger(parsed) && parsed >= 0) {
+      return parsed;
+    }
+  }
+
+  // Fall back to the current process uid.
+  if (typeof process.getuid === "function") {
+    const uid = process.getuid();
+    // Skip root — we want the actual user's runtime dir, not root's.
+    if (uid !== 0) {
+      return uid;
+    }
+  }
+
+  // Last resort: look up the target user by name via os.userInfo().
+  const targetUser = env.SUDO_USER?.trim() || env.USER?.trim() || env.LOGNAME?.trim();
+  if (!targetUser || targetUser === "root") {
+    return null;
+  }
+  try {
+    const info = os.userInfo();
+    if (info.username === targetUser && info.uid !== 0) {
+      return info.uid;
+    }
+  } catch {
+    // ignore
+  }
+  return null;
 }
 
 function readSystemctlDetail(result: { stdout: string; stderr: string }): string {
@@ -426,6 +500,25 @@ async function execSystemctlUser(
   }
 
   const detail = `${directResult.stderr} ${directResult.stdout}`.trim();
+
+  // On headless SSH sessions, XDG_RUNTIME_DIR is often unset, preventing
+  // systemctl --user from connecting to the user's D-Bus socket. Resolve it
+  // from the uid and retry before falling back to --machine/sudo approaches,
+  // since the direct --user path handles unit files and enable/disable
+  // correctly whereas --machine can fail to locate user unit files.
+  if (shouldFallbackToMachineUserScope(detail)) {
+    const envOverrides = await resolveUserScopeEnv(env);
+    if (envOverrides) {
+      const withEnvResult = await execSystemctl(
+        [...resolveSystemctlDirectUserScopeArgs(), ...args],
+        envOverrides,
+      );
+      if (withEnvResult.code === 0) {
+        return withEnvResult;
+      }
+    }
+  }
+
   if (!machineUser || !shouldFallbackToMachineUserScope(detail)) {
     return directResult;
   }
